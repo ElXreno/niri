@@ -13,6 +13,7 @@ output "eDP-1" {
     transform "90"
     position x=1280 y=0
     variable-refresh-rate // on-demand=true
+    // scaling-mode "full"
     focus-at-startup
     backdrop-color "#001100"
 
@@ -222,6 +223,32 @@ This is helpful to avoid various issues with VRR, since it can be disabled most 
 ```kdl
 output "HDMI-A-1" {
     variable-refresh-rate on-demand=true
+}
+```
+
+### `scaling-mode`
+
+<sup>Since: next release</sup>
+
+Set the GPU scaler mode for this output, controlling how non-native resolutions are displayed on the panel.
+
+This is useful when running a lower resolution (e.g. for gaming) and you want to stretch it to fill the screen.
+
+Only supported on some connector types and GPU drivers.
+AMDGPU exposes this property on all connectors; Intel (i915) exposes it on eDP and LVDS.
+If the property is not available, niri will print a warning and ignore the setting.
+
+Valid values are:
+
+- `"none"`: no scaling, the image is displayed at its native size
+- `"full"`: stretch to fill the entire panel, ignoring aspect ratio
+- `"center"`: center without scaling (black borders on all sides)
+- `"full-aspect"`: scale to fill as much as possible while preserving aspect ratio (black bars on two sides)
+
+```kdl
+// Stretch a lower resolution to fill the laptop panel.
+output "eDP-1" {
+    scaling-mode "full"
 }
 ```
 

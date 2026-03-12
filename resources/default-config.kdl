@@ -94,6 +94,12 @@ input {
     // normal, 90, 180, 270, flipped, flipped-90, flipped-180 and flipped-270.
     transform "normal"
 
+    // Scaling mode controls how the GPU scaler handles non-native resolutions.
+    // Valid values are: "none", "full", "center" and "full-aspect".
+    // "full" stretches to fill the panel, "full-aspect" preserves the aspect ratio.
+    // Only supported on some connector types (e.g. eDP with AMDGPU or Intel).
+    // scaling-mode "full"
+
     // Position of the output in the global coordinate space.
     // This affects directional monitor actions like "focus-monitor-left", and cursor movement.
     // The cursor can only move between directly adjacent outputs.

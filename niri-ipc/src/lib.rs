@@ -1070,6 +1070,12 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", command(flatten))]
         vrr: VrrToSet,
     },
+    /// Set the output scaling mode (how non-native resolutions are scaled).
+    ScalingMode {
+        /// Scaling mode to set.
+        #[cfg_attr(feature = "clap", arg())]
+        scaling_mode: ScalingMode,
+    },
 }
 
 /// Output mode to set.
@@ -1171,6 +1177,24 @@ pub struct VrrToSet {
     pub on_demand: bool,
 }
 
+/// Output scaling mode for non-native resolutions.
+///
+/// Controls how the GPU scaler handles resolutions that don't match the panel's native
+/// resolution.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum ScalingMode {
+    /// No scaling.
+    None,
+    /// Stretch to fill the entire output, ignoring aspect ratio.
+    Full,
+    /// Center without scaling.
+    Center,
+    /// Scale to fill as much as possible while preserving aspect ratio.
+    FullAspect,
+}
+
 /// Connected output.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -1197,6 +1221,8 @@ pub struct Output {
     pub vrr_supported: bool,
     /// Whether variable refresh rate is enabled on the output.
     pub vrr_enabled: bool,
+    /// Current scaling mode, if the connector supports it.
+    pub scaling_mode: Option<ScalingMode>,
     /// Logical output information.
     ///
     /// `None` if the output is not mapped to any logical output (for example, if it is disabled).
@@ -1747,6 +1773,20 @@ impl FromStr for Transform {
                 r#"invalid transform, can be "90", "180", "270", "#,
                 r#""flipped", "flipped-90", "flipped-180" or "flipped-270""#
             )),
+        }
+    }
+}
+
+impl FromStr for ScalingMode {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "full" => Ok(Self::Full),
+            "center" => Ok(Self::Center),
+            "full-aspect" => Ok(Self::FullAspect),
+            _ => Err(r#"invalid scaling mode, can be "none", "full", "center" or "full-aspect""#),
         }
     }
 }

@@ -1894,6 +1894,9 @@ impl State {
                     None
                 }
             }
+            niri_ipc::OutputAction::ScalingMode { scaling_mode } => {
+                config.scaling_mode = Some(scaling_mode);
+            }
         });
 
         self.reload_output_config();

@@ -390,6 +390,8 @@ struct Surface {
     /// Plot name for the presentation misprediction plot.
     presentation_misprediction_plot_name: tracy_client::PlotName,
     sequence_delta_plot_name: tracy_client::PlotName,
+    /// Current scaling mode set on the connector.
+    current_scaling_mode: Option<niri_ipc::ScalingMode>,
 }
 
 pub struct SurfaceDmabufFeedback {
@@ -1307,6 +1309,13 @@ impl Tty {
             }
         }
 
+        // Set scaling mode if configured.
+        if let Some(scaling_mode) = config.scaling_mode {
+            if let Err(err) = set_scaling_mode(&device.drm, connector.handle(), scaling_mode) {
+                warn!("error setting scaling mode: {err:?}");
+            }
+        }
+
         // Update the output mode.
         let (physical_width, physical_height) = connector.size().unwrap_or((0, 0));
 
@@ -1483,6 +1492,7 @@ impl Tty {
             time_since_presentation_plot_name,
             presentation_misprediction_plot_name,
             sequence_delta_plot_name,
+            current_scaling_mode: config.scaling_mode,
         };
 
         let res = device.surfaces.insert(crtc, surface);
@@ -2121,6 +2131,8 @@ impl Tty {
                     });
                 let vrr_enabled = surface.is_some_and(|surface| surface.compositor.vrr_enabled());
 
+                let scaling_mode = get_scaling_mode(&device.drm, connector.handle());
+
                 let logical = niri
                     .global_space
                     .outputs()
@@ -2147,6 +2159,7 @@ impl Tty {
                     is_custom_mode,
                     vrr_supported,
                     vrr_enabled,
+                    scaling_mode,
                     logical,
                 };
 
@@ -2366,8 +2379,10 @@ impl Tty {
                 let vrr_enabled = surface.compositor.vrr_enabled();
                 let change_always_vrr = vrr_enabled != config.is_vrr_always_on();
                 let is_on_demand_vrr = config.is_vrr_on_demand();
+                let desired_scaling_mode = config.scaling_mode;
+                let change_scaling_mode = desired_scaling_mode != surface.current_scaling_mode;
 
-                if !change_mode && !change_always_vrr && !is_on_demand_vrr {
+                if !change_mode && !change_always_vrr && !is_on_demand_vrr && !change_scaling_mode {
                     continue;
                 }
 
@@ -2402,6 +2417,39 @@ impl Tty {
                     output_state
                         .frame_clock
                         .set_vrr(surface.compositor.vrr_enabled());
+                }
+
+                if change_scaling_mode {
+                    if let Some(scaling_mode) = desired_scaling_mode {
+                        match set_scaling_mode(&device.drm, surface.connector, scaling_mode) {
+                            Ok(()) => {
+                                surface.current_scaling_mode = Some(scaling_mode);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "output {:?}: error setting scaling mode: {err:?}",
+                                    surface.name.connector
+                                );
+                            }
+                        }
+                    } else {
+                        // Reset to default when unconfigured.
+                        match set_scaling_mode(
+                            &device.drm,
+                            surface.connector,
+                            niri_ipc::ScalingMode::FullAspect,
+                        ) {
+                            Ok(()) => {
+                                surface.current_scaling_mode = None;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "output {:?}: error resetting scaling mode: {err:?}",
+                                    surface.name.connector
+                                );
+                            }
+                        }
+                    }
                 }
 
                 if change_mode {
@@ -2827,6 +2875,64 @@ fn get_drm_property(
     props
         .into_iter()
         .find_map(|(handle, value)| (handle == prop).then_some(value))
+}
+
+fn set_scaling_mode(
+    drm: &DrmDevice,
+    connector: connector::Handle,
+    mode: niri_ipc::ScalingMode,
+) -> anyhow::Result<()> {
+    let (handle, info, current) =
+        find_drm_property(drm, connector, "scaling mode").context("no scaling mode property")?;
+
+    let property::ValueType::Enum(ref enum_values) = info.value_type() else {
+        bail!("wrong property type for scaling mode");
+    };
+
+    let target_name = match mode {
+        niri_ipc::ScalingMode::None => "None",
+        niri_ipc::ScalingMode::Full => "Full",
+        niri_ipc::ScalingMode::Center => "Center",
+        niri_ipc::ScalingMode::FullAspect => "Full aspect",
+    };
+
+    let (_, enums) = enum_values.values();
+    let value = enums
+        .iter()
+        .find(|e| e.name().to_str().ok() == Some(target_name))
+        .map(|e| e.value())
+        .with_context(|| format!("scaling mode {target_name:?} not supported by this connector"))?;
+
+    if current != value {
+        drm.set_property(connector, handle, value)
+            .context("error setting scaling mode property")?;
+    }
+
+    Ok(())
+}
+
+fn get_scaling_mode(
+    drm: &DrmDevice,
+    connector: connector::Handle,
+) -> Option<niri_ipc::ScalingMode> {
+    let (_, info, value) = find_drm_property(drm, connector, "scaling mode")?;
+    let property::ValueType::Enum(ref enum_values) = info.value_type() else {
+        return None;
+    };
+    let (_, enums) = enum_values.values();
+    let name = enums
+        .iter()
+        .find(|e| e.value() == value)?
+        .name()
+        .to_str()
+        .ok()?;
+    match name {
+        "None" => Some(niri_ipc::ScalingMode::None),
+        "Full" => Some(niri_ipc::ScalingMode::Full),
+        "Center" => Some(niri_ipc::ScalingMode::Center),
+        "Full aspect" => Some(niri_ipc::ScalingMode::FullAspect),
+        _ => None,
+    }
 }
 
 fn refresh_interval(mode: DrmMode) -> Duration {

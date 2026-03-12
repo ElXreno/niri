@@ -535,6 +535,7 @@ fn print_output(output: Output) -> anyhow::Result<()> {
         is_custom_mode,
         vrr_supported,
         vrr_enabled,
+        scaling_mode,
         logical,
     } = output;
 
@@ -585,6 +586,16 @@ fn print_output(output: Output) -> anyhow::Result<()> {
         println!("  Variable refresh rate: supported, {enabled}");
     } else {
         println!("  Variable refresh rate: not supported");
+    }
+
+    if let Some(scaling_mode) = scaling_mode {
+        let mode = match scaling_mode {
+            niri_ipc::ScalingMode::None => "none",
+            niri_ipc::ScalingMode::Full => "full",
+            niri_ipc::ScalingMode::Center => "center",
+            niri_ipc::ScalingMode::FullAspect => "full-aspect",
+        };
+        println!("  Scaling mode: {mode}");
     }
 
     if let Some((width, height)) = physical_size {

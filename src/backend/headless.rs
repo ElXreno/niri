@@ -108,6 +108,7 @@ impl Headless {
                 is_custom_mode: true,
                 vrr_supported: false,
                 vrr_enabled: false,
+                scaling_mode: None,
                 logical: Some(logical_output(&output)),
             },
         );

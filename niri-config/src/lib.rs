@@ -765,6 +765,7 @@ mod tests {
                 max-bpc 10
                 hdr mode="on" {
                     reference-luminance 203
+                    peak-luminance 800
                 }
                 variable-refresh-rate on-demand=true
                 background-color "rgba(25, 25, 102, 1.0)"
@@ -1201,6 +1202,11 @@ mod tests {
                                 reference_luminance: Some(
                                     FloatOrInt(
                                         203.0,
+                                    ),
+                                ),
+                                peak_luminance: Some(
+                                    FloatOrInt(
+                                        800.0,
                                     ),
                                 ),
                             },

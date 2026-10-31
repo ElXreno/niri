@@ -27,14 +27,14 @@ tracy-client = { version = "0.18.5", default-features = false }
 
 [workspace.dependencies.smithay]
 # version = "0.4.1"
-git = "https://github.com/Smithay/smithay.git"
-rev = "8a270232f1bfc416c781273c98a3f52a812a0bba"
+git = "https://github.com/ElXreno/smithay.git"
+rev = "94f256d8c9324b5bbb95832537c606c93f70820c"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
 # version = "0.1.0"
-git = "https://github.com/Smithay/smithay.git"
-rev = "8a270232f1bfc416c781273c98a3f52a812a0bba"
+git = "https://github.com/ElXreno/smithay.git"
+rev = "94f256d8c9324b5bbb95832537c606c93f70820c"
 # path = "../smithay/smithay-drm-extras"
 
 [package]
@@ -187,9 +187,3 @@ assets = [
     ["resources/niri.service", "/usr/lib/systemd/user/", "644"],
     ["resources/niri-shutdown.target", "/usr/lib/systemd/user/", "644"],
 ]
-
-# Local smithay with connector color state support (HDR) and the color-management
-# protocol from Smithay PR #1143. To be removed once both are upstream.
-[patch."https://github.com/Smithay/smithay.git"]
-smithay = { path = "../smithay" }
-smithay-drm-extras = { path = "../smithay/smithay-drm-extras" }

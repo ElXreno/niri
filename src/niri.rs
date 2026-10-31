@@ -14,9 +14,11 @@ use _server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as 
 use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
+use niri_config::input::XkbFile;
 use niri_config::output::{HdrMode, MaxBpc};
+use niri_config::window_rule::VrrRule;
 use niri_config::{
-    Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
+    Bind, Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
@@ -46,7 +48,7 @@ use smithay::desktop::{
     find_popup_root_surface, layer_map_for_output, LayerMap, LayerSurface, PopupGrab, PopupManager,
     PopupUngrabStrategy, Space, Window, WindowSurfaceType,
 };
-use smithay::input::keyboard::{Layout as KeyboardLayout, XkbConfig};
+use smithay::input::keyboard::{Layout as KeyboardLayout, LedState, XkbConfig};
 use smithay::input::pointer::{
     CursorIcon, CursorImageStatus, CursorImageSurfaceData, Focus,
     GrabStartData as PointerGrabStartData, MotionEvent,
@@ -119,6 +121,7 @@ use smithay::wayland::tablet_manager::TabletManagerState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
+use smithay::wayland::virtual_pointer::VirtualPointerManagerState;
 use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xdg_foreign::XdgForeignState;
 use wayland_server::protocol::wl_output::WlOutput;
@@ -141,13 +144,15 @@ use crate::frame_clock::FrameClock;
 use crate::handlers::image_copy_capture::{
     self as image_copy_capture_impl, CaptureBuffer, ImageCopyCursorSession, ImageCopySession,
 };
+use crate::handlers::virtual_keyboard::VirtualKeyboardKeymap;
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
-    apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
-    mods_with_tablet_stylus_binds, mods_with_wheel_binds, TabletData,
+    apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_horizontal_wheel_binds,
+    mods_with_mouse_binds, mods_with_tablet_stylus_binds, mods_with_vertical_wheel_binds,
+    TabletData,
 };
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
@@ -164,7 +169,6 @@ use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
-use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blend::{
     scanout_color_transform, set_sdr_capture_blend, BlendSurfaceRenderElement, ContentColor,
     DEFAULT_REFERENCE_LUMINANCE,
@@ -195,8 +199,8 @@ use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
-    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
-    logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
+    center, center_f64, get_monotonic_time, ipc_transform_to_smithay, is_mapped, logical_output,
+    make_screenshot_path, output_matches_name, output_size, panel_orientation,
     send_scale_transform, winit_scale, write_png_rgba8, xwayland,
 };
 use crate::window::mapped::MappedId;
@@ -208,6 +212,14 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+/// Parts of the seat keyboard state that get reset when its keymap is replaced.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SavedKeyboardState {
+    pub layout: Option<KeyboardLayout>,
+    pub caps_lock: Option<bool>,
+    pub num_lock: Option<bool>,
+}
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -284,6 +296,9 @@ pub struct Niri {
     /// startup, libinput will immediately send a closed event.
     pub is_lid_closed: bool,
 
+    /// Runtime toggle for touchpad disabled state (combined with config.touchpad.off).
+    pub touchpad_disabled_by_toggle: bool,
+
     pub devices: HashSet<input::Device>,
     pub tablets: HashMap<input::Device, TabletData>,
     pub touch: HashSet<input::Device>,
@@ -355,6 +370,12 @@ pub struct Niri {
     pub suppressed_keys: HashSet<Keycode>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
+    /// Binds whose release action is pending, keyed by the key code.
+    pub pending_release_binds: HashMap<Keycode, Bind>,
+    /// Same as `pending_release_binds`, but for mouse buttons, keyed by the button code.
+    pub pending_mouse_release_binds: HashMap<u32, Bind>,
+    /// Same as `pending_release_binds`, but for tablet tool buttons, keyed by the button code.
+    pub pending_tablet_release_binds: HashMap<u32, Bind>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
@@ -365,6 +386,21 @@ pub struct Niri {
 
     /// Most recent XKB settings from org.freedesktop.locale1.
     pub xkb_from_locale1: Option<Xkb>,
+
+    /// Virtual keyboard for which the keymap is currently active on the seat,
+    /// if any.
+    ///
+    /// Note that the keymap may be changed by the client at any time, and it
+    /// only gets activated on the next key/modifier event from the virtual
+    /// keyboard.
+    pub virtual_keyboard_keymap: Option<VirtualKeyboardKeymap>,
+    /// Configured (non-virtual-keyboard) keymap as XKB_KEYMAP_FORMAT_TEXT_V1.
+    ///
+    /// Computed lazily from the seat while no virtual keyboard keymap is
+    /// active, and cleared whenever the configured keymap changes. Used to
+    /// compare against virtual keyboard keymaps, and to switch back to it
+    /// afterwards without going through the config again.
+    pub configured_keymap: Option<Arc<str>>,
 
     pub cursor_manager: CursorManager,
     pub cursor_texture_cache: CursorTextureCache,
@@ -404,7 +440,8 @@ pub struct Niri {
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_wheel_tracker: ScrollTracker,
     pub mods_with_mouse_binds: HashSet<Modifiers>,
-    pub mods_with_wheel_binds: HashSet<Modifiers>,
+    pub mods_with_horizontal_wheel_binds: HashSet<Modifiers>,
+    pub mods_with_vertical_wheel_binds: HashSet<Modifiers>,
     pub mods_with_tablet_stylus_binds: HashSet<Modifiers>,
     pub vertical_finger_scroll_tracker: ScrollTracker,
     pub horizontal_finger_scroll_tracker: ScrollTracker,
@@ -445,6 +482,9 @@ pub struct Niri {
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
+
+    #[cfg(test)]
+    pub test_action_count: usize,
 }
 
 smithay::delegate_dispatch2!(State);
@@ -571,8 +611,10 @@ pub struct PointContents {
     pub window: Option<(Window, HitType)>,
     // If surface belongs to a layer surface, this is that layer surface.
     pub layer: Option<LayerSurface>,
-    // Pointer is over a hot corner.
+    // Point is over a hot corner.
     pub hot_corner: bool,
+    // Point is over the overview.
+    pub overview: bool,
 }
 
 #[derive(Debug, Default)]
@@ -868,6 +910,7 @@ impl State {
         self.refresh_ipc_outputs();
         self.ipc_refresh_layout();
         self.ipc_refresh_keyboard_layout_index();
+        self.ipc_refresh_touchpad();
 
         // Needs to be called after updating the keyboard focus.
         #[cfg(feature = "dbus")]
@@ -1507,35 +1550,24 @@ impl State {
     }
 
     /// Loads the xkb keymap from a file config setting.
-    fn set_xkb_file(&mut self, xkb_file: String) -> anyhow::Result<()> {
-        let xkb_file = PathBuf::from(xkb_file);
-        let xkb_file = expand_home(&xkb_file)
-            .context("failed to expand ~")?
-            .unwrap_or(xkb_file);
-
-        let keymap = std::fs::read_to_string(xkb_file).context("failed to read xkb_file")?;
-
+    fn set_xkb_file_content(&mut self, keymap: String) -> anyhow::Result<()> {
         let keyboard = self.niri.seat.get_keyboard().unwrap();
-        let num_lock = keyboard.modifier_state().num_lock;
+        let restore = self.keyboard_state_to_restore();
 
         keyboard
             .set_keymap_from_string(self, keymap)
             .context("failed to set keymap")?;
-
-        // Restore num lock to its previous value.
-        let mut mods_state = keyboard.modifier_state();
-        if mods_state.num_lock != num_lock {
-            mods_state.num_lock = num_lock;
-            keyboard.set_modifier_state(mods_state);
-        }
+        self.niri.virtual_keyboard_keymap = None;
+        self.niri.configured_keymap = None;
+        self.restore_keyboard_state(restore);
 
         Ok(())
     }
 
     fn load_xkb_file(&mut self) {
         let xkb_file = self.niri.config.borrow().input.keyboard.xkb.file.clone();
-        if let Some(xkb_file) = xkb_file {
-            if let Err(err) = self.set_xkb_file(xkb_file) {
+        if let Some(XkbFile(Some(keymap))) = xkb_file {
+            if let Err(err) = self.set_xkb_file_content(keymap) {
                 warn!("error loading xkb_file: {err:?}");
             }
         }
@@ -1543,18 +1575,124 @@ impl State {
 
     pub fn set_xkb_config(&mut self, xkb: XkbConfig) {
         let keyboard = self.niri.seat.get_keyboard().unwrap();
-        let num_lock = keyboard.modifier_state().num_lock;
+        let restore = self.keyboard_state_to_restore();
         if let Err(err) = keyboard.set_xkb_config(self, xkb) {
             warn!("error updating xkb config: {err:?}");
             return;
         }
+        self.niri.virtual_keyboard_keymap = None;
+        self.niri.configured_keymap = None;
+        self.restore_keyboard_state(restore);
+    }
 
-        // Restore num lock to its previous value.
-        let mut mods_state = keyboard.modifier_state();
-        if mods_state.num_lock != num_lock {
-            mods_state.num_lock = num_lock;
-            keyboard.set_modifier_state(mods_state);
+    /// Returns the keyboard state to restore after replacing the seat's keymap (which resets it).
+    ///
+    /// When switching back from a virtual keyboard's keymap, this is the state from before it was
+    /// activated. Otherwise, only Num Lock is carried over.
+    pub fn keyboard_state_to_restore(&self) -> SavedKeyboardState {
+        match &self.niri.virtual_keyboard_keymap {
+            Some(active) => active.saved,
+            None => {
+                let keyboard = self.niri.seat.get_keyboard().unwrap();
+                SavedKeyboardState {
+                    num_lock: Some(keyboard.modifier_state().num_lock),
+                    ..Default::default()
+                }
+            }
         }
+    }
+
+    /// Returns the current keyboard state that gets reset by replacing the seat's keymap.
+    pub fn current_keyboard_state(&mut self) -> SavedKeyboardState {
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        let mods = keyboard.modifier_state();
+        let layout = keyboard.with_xkb_state(self, |context| {
+            context.xkb().lock().unwrap().active_layout()
+        });
+        SavedKeyboardState {
+            layout: Some(layout),
+            caps_lock: Some(mods.caps_lock),
+            num_lock: Some(mods.num_lock),
+        }
+    }
+
+    pub fn restore_keyboard_state(&mut self, state: SavedKeyboardState) {
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+
+        let mut mods = keyboard.modifier_state();
+        let mut mods_changed = false;
+        if let Some(caps_lock) = state.caps_lock {
+            if mods.caps_lock != caps_lock {
+                mods.caps_lock = caps_lock;
+                mods_changed = true;
+            }
+        }
+        if let Some(num_lock) = state.num_lock {
+            if mods.num_lock != num_lock {
+                mods.num_lock = num_lock;
+                mods_changed = true;
+            }
+        }
+        if mods_changed {
+            keyboard.set_modifier_state(mods);
+            // set_modifier_state() doesn't update the LED state of physical keyboards.
+            self.update_keyboard_leds(keyboard.led_state());
+            // set_modifier_state() doesn't tell the focused client on its own.
+            keyboard.advertise_modifier_state(self);
+        }
+
+        // set_modifier_state() can reset the layout, so restore it afterwards.
+        if let Some(layout) = state.layout {
+            keyboard.with_xkb_state(self, |mut context| {
+                let (exists, current) = {
+                    let xkb = context.xkb().lock().unwrap();
+                    (xkb.layouts().any(|l| l == layout), xkb.active_layout())
+                };
+                if exists && current != layout {
+                    context.set_layout(layout);
+                }
+            });
+        }
+    }
+
+    pub fn update_keyboard_leds(&mut self, led_state: LedState) {
+        let keyboards = self
+            .niri
+            .devices
+            .iter()
+            .filter(|device| device.has_capability(input::DeviceCapability::Keyboard))
+            .cloned();
+
+        for mut keyboard in keyboards {
+            keyboard.led_update(led_state.into());
+        }
+    }
+
+    /// Loads the configured keymap (xkb file, xkb config, or locale1's) onto the seat, replacing a
+    /// virtual keyboard's if there is one.
+    pub fn load_configured_keymap(&mut self) {
+        let mut xkb = self.niri.config.borrow().input.keyboard.xkb.clone();
+        let mut set_xkb_config = true;
+
+        if let Some(XkbFile(Some(keymap))) = xkb.file.take() {
+            if let Err(err) = self.set_xkb_file_content(keymap) {
+                warn!("error loading xkb_file: {err:?}");
+            } else {
+                set_xkb_config = false;
+            }
+        }
+
+        if set_xkb_config {
+            // If xkb is unset in the niri config, use settings from locale1.
+            if xkb == Xkb::default() {
+                trace!("using xkb from locale1");
+                xkb = self.niri.xkb_from_locale1.clone().unwrap_or_default();
+            }
+
+            self.set_xkb_config(xkb.to_xkb_config());
+        }
+
+        self.ipc_keyboard_layouts_changed();
     }
 
     pub fn reload_config(&mut self, config: Result<Config, ()>) {
@@ -1604,7 +1742,7 @@ impl State {
 
         *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
-        let mut reload_xkb = None;
+        let mut reload_xkb = false;
         let mut libinput_config_changed = false;
         let mut output_config_changed = false;
         let mut preserved_output_config = None;
@@ -1624,9 +1762,14 @@ impl State {
             self.niri.cursor_texture_cache.clear();
         }
 
+        if config.debug.nested_show_host_cursor != old_config.debug.nested_show_host_cursor {
+            self.backend
+                .set_host_cursor_visible(config.debug.nested_show_host_cursor);
+        }
+
         // We need &mut self to reload the xkb config, so just store it here.
         if config.input.keyboard.xkb != old_config.input.keyboard.xkb {
-            reload_xkb = Some(config.input.keyboard.xkb.clone());
+            reload_xkb = true;
         }
 
         // Reload the repeat info.
@@ -1666,16 +1809,24 @@ impl State {
 
         let binds_changed = config.binds != old_config.binds;
         let new_mod_key = self.backend.mod_key(&config);
+        let mut hotkey_overlay_changed =
+            config.hotkey_overlay.hide_not_bound != old_config.hotkey_overlay.hide_not_bound;
         if new_mod_key != self.backend.mod_key(&old_config) || binds_changed {
-            self.niri
-                .hotkey_overlay
-                .on_hotkey_config_updated(new_mod_key);
+            hotkey_overlay_changed = true;
             self.niri.mods_with_mouse_binds = mods_with_mouse_binds(new_mod_key, &config.binds);
-            self.niri.mods_with_wheel_binds = mods_with_wheel_binds(new_mod_key, &config.binds);
+            self.niri.mods_with_horizontal_wheel_binds =
+                mods_with_horizontal_wheel_binds(new_mod_key, &config.binds);
+            self.niri.mods_with_vertical_wheel_binds =
+                mods_with_vertical_wheel_binds(new_mod_key, &config.binds);
             self.niri.mods_with_tablet_stylus_binds =
                 mods_with_tablet_stylus_binds(new_mod_key, &config.binds);
             self.niri.mods_with_finger_scroll_binds =
                 mods_with_finger_scroll_binds(new_mod_key, &config.binds);
+        }
+        if hotkey_overlay_changed {
+            self.niri
+                .hotkey_overlay
+                .on_hotkey_config_updated(new_mod_key);
         }
 
         if config.window_rules != old_config.window_rules {
@@ -1756,37 +1907,18 @@ impl State {
         drop(old_config);
 
         // Now with a &mut self we can reload the xkb config.
-        if let Some(mut xkb) = reload_xkb {
-            let mut set_xkb_config = true;
-
-            // It's fine to .take() the xkb file, as this is a
-            // clone and the file field is not used in the XkbConfig.
-            if let Some(xkb_file) = xkb.file.take() {
-                if let Err(err) = self.set_xkb_file(xkb_file) {
-                    warn!("error reloading xkb_file: {err:?}");
-                } else {
-                    // We successfully set xkb file so we don't need to fallback to XkbConfig.
-                    set_xkb_config = false;
-                }
-            }
-
-            if set_xkb_config {
-                // If xkb is unset in the niri config, use settings from locale1.
-                if xkb == Xkb::default() {
-                    trace!("using xkb from locale1");
-                    xkb = self.niri.xkb_from_locale1.clone().unwrap_or_default();
-                }
-
-                self.set_xkb_config(xkb.to_xkb_config());
-            }
-
-            self.ipc_keyboard_layouts_changed();
+        if reload_xkb {
+            self.load_configured_keymap();
         }
 
         if libinput_config_changed {
             let config = self.niri.config.borrow();
             for mut device in self.niri.devices.iter().cloned() {
-                apply_libinput_settings(&config.input, &mut device);
+                apply_libinput_settings(
+                    &config.input,
+                    &mut device,
+                    self.niri.touchpad_disabled_by_toggle,
+                );
             }
         }
 
@@ -2120,7 +2252,23 @@ impl State {
             return;
         };
 
-        // Now that we captured the screenshots, clear grabs like drag-and-drop, etc.
+        // Now that we captured the screenshots, clear grabs.
+        self.cancel_pointing_grabs();
+
+        self.backend.with_primary_renderer(|renderer| {
+            self.niri
+                .screenshot_ui
+                .open(renderer, screenshots, default_output, show_pointer, path)
+        });
+
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
+        self.niri.queue_redraw_all();
+    }
+
+    /// Cancel pointing device grabs like drag-and-drop, etc.
+    pub fn cancel_pointing_grabs(&mut self) {
         let time = InputTime::now();
         self.niri
             .seat
@@ -2134,17 +2282,6 @@ impl State {
         for tool in self.niri.seat.tablet_seat().get_tools().into_values() {
             tool.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
         }
-
-        self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .screenshot_ui
-                .open(renderer, screenshots, default_output, show_pointer, path)
-        });
-
-        self.niri
-            .cursor_manager
-            .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
-        self.niri.queue_redraw_all();
     }
 
     pub fn handle_pick_color(&mut self, tx: async_channel::Sender<Option<niri_ipc::PickedColor>>) {
@@ -2855,7 +2992,10 @@ impl Niri {
 
         let mod_key = backend.mod_key(&config.borrow());
         let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds);
-        let mods_with_wheel_binds = mods_with_wheel_binds(mod_key, &config_.binds);
+        let mods_with_horizontal_wheel_binds =
+            mods_with_horizontal_wheel_binds(mod_key, &config_.binds);
+        let mods_with_vertical_wheel_binds =
+            mods_with_vertical_wheel_binds(mod_key, &config_.binds);
         let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
         let mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(mod_key, &config_.binds);
 
@@ -2963,6 +3103,7 @@ impl Niri {
             blocker_cleared_rx,
             monitors_active: true,
             is_lid_closed: false,
+            touchpad_disabled_by_toggle: false,
 
             devices: HashSet::new(),
             tablets: HashMap::new(),
@@ -3010,6 +3151,9 @@ impl Niri {
             popup_grab: None,
             suppressed_keys: HashSet::new(),
             suppressed_buttons: HashSet::new(),
+            pending_release_binds: HashMap::new(),
+            pending_mouse_release_binds: HashMap::new(),
+            pending_tablet_release_binds: HashMap::new(),
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             presentation_state,
@@ -3028,6 +3172,8 @@ impl Niri {
             is_fdo_idle_inhibited: Arc::new(AtomicBool::new(false)),
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
             xkb_from_locale1: None,
+            virtual_keyboard_keymap: None,
+            configured_keymap: None,
             cursor_manager,
             cursor_texture_cache: Default::default(),
             cursor_shape_manager_state,
@@ -3045,7 +3191,8 @@ impl Niri {
             vertical_wheel_tracker: ScrollTracker::new(120),
             horizontal_wheel_tracker: ScrollTracker::new(120),
             mods_with_mouse_binds,
-            mods_with_wheel_binds,
+            mods_with_horizontal_wheel_binds,
+            mods_with_vertical_wheel_binds,
             mods_with_tablet_stylus_binds,
 
             // 10 is copied from Clutter: DISCRETE_SCROLL_STEP.
@@ -3086,6 +3233,9 @@ impl Niri {
 
             #[cfg(feature = "xdp-gnome-screencast")]
             casting: screencasting,
+
+            #[cfg(test)]
+            test_action_count: 0,
         };
 
         niri.reset_pointer_inactivity_timer();
@@ -3884,6 +4034,7 @@ impl Niri {
                 .or_else(|| layer_toplevel_under(Layer::Background));
         } else {
             if self.is_inside_hot_corner(output, pos_within_output) {
+                rv.overview = is_overview_open;
                 rv.hot_corner = true;
                 return rv;
             }
@@ -3891,6 +4042,10 @@ impl Niri {
             under = under
                 .or_else(|| layer_popup_under(Layer::Top))
                 .or_else(|| layer_toplevel_under(Layer::Top));
+
+            if is_overview_open && under.is_none() {
+                rv.overview = true;
+            }
 
             under = under.or_else(interactive_moved_window_under);
 
@@ -5186,19 +5341,34 @@ impl Niri {
             return;
         }
 
-        let current = self.layout.windows_for_output(output).any(|mapped| {
-            mapped.rules().variable_refresh_rate == Some(true) && {
-                let mut visible = false;
-                mapped.window.with_surfaces(|surface, states| {
-                    if !visible
-                        && surface_primary_scanout_output(surface, states).as_ref() == Some(output)
-                    {
-                        visible = true;
-                    }
-                });
-                visible
-            }
-        });
+        // Check for fullscreen-only VRR first as that's cheaper.
+        let mon = self.layout.monitor_for_output(output).unwrap();
+        // We allow the overlay layer and floating windows for this check
+        // so VRR keeps working with overlays.
+        let current = mon
+            .fullscreen_window_above_top_layer()
+            .is_some_and(|mapped| {
+                mapped.rules().variable_refresh_rate == Some(VrrRule::FullscreenOnly)
+            });
+
+        let current = current
+            || self.layout.windows_for_output(output).any(|mapped| {
+                mapped.rules().variable_refresh_rate == Some(VrrRule::On) && {
+                    let mut visible = false;
+                    mapped.window.with_surfaces(|surface, states| {
+                        if visible {
+                            // Skip checking.
+                            return;
+                        }
+
+                        if surface_primary_scanout_output(surface, states).as_ref() == Some(output)
+                        {
+                            visible = true;
+                        }
+                    });
+                    visible
+                }
+            });
 
         backend.set_output_on_demand_vrr(self, output, current);
     }
@@ -5571,6 +5741,10 @@ impl Niri {
     }
 
     pub fn send_frame_callbacks_on_fallback_timer(&mut self) {
+        if !self.monitors_active || self.output_state.is_empty() {
+            return;
+        }
+
         let _span = tracy_client::span!("Niri::send_frame_callbacks_on_fallback_timer");
 
         // Make up a bogus output; we don't care about it here anyway, just the throttling timer.
@@ -6760,6 +6934,19 @@ impl Niri {
         Ok(())
     }
 
+    pub fn clear_input_state(&mut self) {
+        self.suppressed_keys.clear();
+        self.suppressed_buttons.clear();
+        self.pending_release_binds.clear();
+        self.pending_mouse_release_binds.clear();
+        self.pending_tablet_release_binds.clear();
+
+        // Stop ongoing key repeat if any.
+        if let Some(token) = self.bind_repeat_timer.take() {
+            self.event_loop.remove(token);
+        }
+    }
+
     pub fn is_locked(&self) -> bool {
         match self.lock_state {
             LockState::Unlocked | LockState::WaitingForSurfaces { .. } => false,
@@ -6798,34 +6985,31 @@ impl Niri {
 
         info!("locking session");
 
+        // If we have outputs, we need to redraw them before locking. But before we do that,
+        // let's wait for the lock surfaces.
+        //
+        // Give them a second; swaylock can take its time to paint a big enough image.
+        let timer = Timer::from_duration(Duration::from_millis(1000));
+        let deadline_token = self
+            .event_loop
+            .insert_source(timer, |_, _, state| {
+                trace!("lock deadline expired, continuing");
+                state.niri.continue_to_locking();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+
+        self.lock_state = LockState::WaitingForSurfaces {
+            confirmation,
+            deadline_token,
+        };
+
+        // If there are no outputs, we can lock right away.
+        //
+        // This does mean the deadline timer above is immediately removed, but it's a rare case,
+        // and consolidating the locking code into one place is worth it.
         if self.output_state.is_empty() {
-            // There are no outputs, lock the session right away.
-            self.screenshot_ui.close();
-            self.cursor_manager
-                .set_cursor_image(CursorImageStatus::default_named());
-
-            let lock = confirmation.ext_session_lock().clone();
-            confirmation.lock();
-            self.lock_state = LockState::Locked(lock);
-        } else {
-            // There are outputs which we need to redraw before locking. But before we do that,
-            // let's wait for the lock surfaces.
-            //
-            // Give them a second; swaylock can take its time to paint a big enough image.
-            let timer = Timer::from_duration(Duration::from_millis(1000));
-            let deadline_token = self
-                .event_loop
-                .insert_source(timer, |_, _, state| {
-                    trace!("lock deadline expired, continuing");
-                    state.niri.continue_to_locking();
-                    TimeoutAction::Drop
-                })
-                .unwrap();
-
-            self.lock_state = LockState::WaitingForSurfaces {
-                confirmation,
-                deadline_token,
-            };
+            self.continue_to_locking();
         }
     }
 
@@ -6864,6 +7048,12 @@ impl Niri {
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
                 self.cancel_mru();
+
+                // I don't like this being asynchronous, but it would be a bit involved to move
+                // this whole function to State. This should do for now.
+                self.event_loop.insert_idle(|state| {
+                    state.cancel_pointing_grabs();
+                });
 
                 if self.output_state.is_empty() {
                     // There are no outputs, lock the session right away.

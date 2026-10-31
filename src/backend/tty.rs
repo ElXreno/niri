@@ -454,10 +454,22 @@ struct EdidHdrInfo {
 }
 
 impl EdidHdrInfo {
-    fn from_edid(info: &libdisplay_info::info::Info) -> Self {
+    fn from_edid(info: &libdisplay_info::info::Info, edid: &[u8]) -> Self {
         let hdr = info.hdr_static_metadata();
         let colorimetry = info.supported_signal_colorimetry();
         let lum_u16 = |v: f32| v.clamp(0.0, u16::MAX as f32).round() as u16;
+        if !hdr.pq {
+            let displayid = DisplayIdHdr::parse(edid);
+            if displayid.pq {
+                return Self {
+                    pq: true,
+                    bt2020_rgb: true,
+                    max_luminance: lum_u16(displayid.max_luminance),
+                    min_luminance: lum_u16(displayid.min_luminance * 10000.),
+                    max_frame_avg_luminance: lum_u16(displayid.max_full_luminance),
+                };
+            }
+        }
         Self {
             pq: hdr.pq,
             bt2020_rgb: colorimetry.bt2020_rgb,
@@ -480,6 +492,74 @@ impl EdidHdrInfo {
             max_frame_avg_luminance,
             ..self
         }
+    }
+}
+
+/// HDR support embedded panels advertise in DisplayID 2.x extension blocks instead of CTA ones.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct DisplayIdHdr {
+    pq: bool,
+    max_luminance: f32,
+    max_full_luminance: f32,
+    min_luminance: f32,
+}
+
+impl DisplayIdHdr {
+    const DISPLAY_PARAMS: u8 = 0x21;
+    const INTERFACE_FEATURES: u8 = 0x26;
+    const BT2020_PQ: u8 = 1 << 6;
+    const COLORSPACE_BT2020: u8 = 6;
+    const EOTF_PQ: u8 = 8;
+
+    fn parse(edid: &[u8]) -> Self {
+        let mut hdr = Self::default();
+        for ext in edid.chunks_exact(128).skip(1) {
+            if ext[0] != 0x70 || ext[1] >> 4 != 2 {
+                continue;
+            }
+            let end = 5 + usize::from(ext[2]).min(121);
+            let mut pos = 5;
+            while pos + 3 <= end {
+                let tag = ext[pos];
+                let len = usize::from(ext[pos + 2]);
+                let Some(payload) = ext.get(pos + 3..pos + 3 + len) else {
+                    break;
+                };
+                match tag {
+                    Self::DISPLAY_PARAMS if len >= 29 => {
+                        let half = |at: usize| half_float(payload[at], payload[at + 1]);
+                        hdr.max_full_luminance = half(0x15);
+                        hdr.max_luminance = half(0x17);
+                        hdr.min_luminance = half(0x19);
+                    }
+                    Self::INTERFACE_FEATURES if len >= 9 => {
+                        let additional = usize::from(payload[8] & 0x7);
+                        hdr.pq |= payload[6] & Self::BT2020_PQ != 0
+                            || payload.iter().skip(9).take(additional).any(|combination| {
+                                combination >> 4 == Self::COLORSPACE_BT2020
+                                    && combination & 0xf == Self::EOTF_PQ
+                            });
+                    }
+                    _ => (),
+                }
+                pos += 3 + len;
+            }
+        }
+        hdr
+    }
+}
+
+fn half_float(lo: u8, hi: u8) -> f32 {
+    let bits = u16::from_le_bytes([lo, hi]);
+    if bits & 0x8000 != 0 {
+        return 0.;
+    }
+    let exp = i32::from((bits >> 10) & 0x1f);
+    let frac = f32::from(bits & 0x3ff);
+    match exp {
+        0 => frac * 2f32.powi(-24),
+        31 => 0.,
+        _ => (1. + frac / 1024.) * 2f32.powi(exp - 15),
     }
 }
 
@@ -1449,8 +1529,12 @@ impl Tty {
         let supports_hdr_metadata = surface
             .hdr_metadata_supported(connector.handle())
             .unwrap_or(false);
-        let edid_hdr = get_edid_info(&device.drm, connector.handle())
-            .map(|info| EdidHdrInfo::from_edid(&info))
+        let edid_hdr = get_edid_blob(&device.drm, connector.handle())
+            .and_then(|data| {
+                let info = libdisplay_info::info::Info::parse_edid(&data)
+                    .context("error parsing EDID")?;
+                Ok(EdidHdrInfo::from_edid(&info, &data))
+            })
             .unwrap_or_default();
         let hdr_supported = supports_bt2020 && supports_hdr_metadata && edid_hdr.pq;
         debug!(
@@ -3951,10 +4035,7 @@ fn pick_mode(
     mode.map(|m| (*m, fallback))
 }
 
-fn get_edid_info(
-    device: &DrmDevice,
-    connector: connector::Handle,
-) -> anyhow::Result<libdisplay_info::info::Info> {
+fn get_edid_blob(device: &DrmDevice, connector: connector::Handle) -> anyhow::Result<Vec<u8>> {
     let (_, info, value) =
         find_drm_property(device, connector, "EDID").context("no EDID property")?;
     let blob = info
@@ -3962,9 +4043,16 @@ fn get_edid_info(
         .convert_value(value)
         .as_blob()
         .context("EDID was not blob type")?;
-    let data = device
+    device
         .get_property_blob(blob)
-        .context("error getting EDID blob value")?;
+        .context("error getting EDID blob value")
+}
+
+fn get_edid_info(
+    device: &DrmDevice,
+    connector: connector::Handle,
+) -> anyhow::Result<libdisplay_info::info::Info> {
+    let data = get_edid_blob(device, connector)?;
     libdisplay_info::info::Info::parse_edid(&data).context("error parsing EDID")
 }
 
@@ -4271,7 +4359,8 @@ mod tests {
     use smithay::wayland::color::management::ImageDescription;
 
     use crate::backend::tty::{
-        build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt, EdidHdrInfo,
+        build_hdr_metadata, calculate_drm_mode_from_modeline, calculate_mode_cvt, DisplayIdHdr,
+        EdidHdrInfo,
     };
 
     #[test]
@@ -4398,6 +4487,45 @@ mod tests {
             CtaCoordinate { x: 34000, y: 16000 }
         );
         assert_eq!(meta.white_point, CtaCoordinate::D65_WHITE);
+    }
+
+    #[test]
+    fn displayid_hdr_from_embedded_panel() {
+        let mut params = [0u8; 29];
+        params[0x15..0x17].copy_from_slice(&0x5fd0u16.to_le_bytes());
+        params[0x17..0x19].copy_from_slice(&0x64b0u16.to_le_bytes());
+        params[0x19..0x1b].copy_from_slice(&0x2a66u16.to_le_bytes());
+        let mut blocks = vec![DisplayIdHdr::DISPLAY_PARAMS, 0, 29];
+        blocks.extend_from_slice(&params);
+        let features = 128 + 5 + blocks.len() + 3;
+        blocks.extend_from_slice(&[DisplayIdHdr::INTERFACE_FEATURES, 0, 10]);
+        blocks.extend_from_slice(&[0x04, 0, 0, 0, 0, 0, DisplayIdHdr::BT2020_PQ, 0, 0, 0]);
+
+        let mut edid = vec![0u8; 256];
+        edid[128] = 0x70;
+        edid[129] = 0x20;
+        edid[130] = blocks.len() as u8;
+        edid[133..133 + blocks.len()].copy_from_slice(&blocks);
+
+        let hdr = DisplayIdHdr::parse(&edid);
+        assert!(hdr.pq);
+        assert_eq!(hdr.max_full_luminance, 500.);
+        assert_eq!(hdr.max_luminance, 1200.);
+        assert!((hdr.min_luminance - 0.05).abs() < 0.0002);
+
+        edid[features + 6] = 0;
+        assert!(!DisplayIdHdr::parse(&edid).pq);
+
+        edid[features + 8] = 1;
+        edid[features + 9] = 0x68;
+        assert!(DisplayIdHdr::parse(&edid).pq);
+
+        edid[features + 9] = 0x60;
+        assert!(!DisplayIdHdr::parse(&edid).pq);
+
+        edid[features + 9] = 0x68;
+        edid[129] = 0x13;
+        assert_eq!(DisplayIdHdr::parse(&edid), DisplayIdHdr::default());
     }
 
     #[test]

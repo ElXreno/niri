@@ -15,7 +15,7 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
 use niri_config::input::XkbFile;
-use niri_config::output::{HdrMode, MaxBpc};
+use niri_config::output::{set_hdr, HdrMode, MaxBpc};
 use niri_config::window_rule::VrrRule;
 use niri_config::{
     Bind, Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
@@ -2200,6 +2200,7 @@ impl State {
                 }
             }
             niri_ipc::OutputAction::MaxBpc { max_bpc } => config.max_bpc = Some(MaxBpc(max_bpc)),
+            niri_ipc::OutputAction::Hdr { hdr } => set_hdr(&mut config.hdr, hdr),
         });
 
         self.reload_output_config();
@@ -2601,7 +2602,14 @@ impl Niri {
             return None;
         }
         let name = output.user_data().get::<OutputName>()?;
-        let hdr = self.config.borrow().outputs.find(name)?.hdr.clone()?;
+        let hdr = self
+            .config
+            .borrow()
+            .outputs
+            .find(name)?
+            .hdr
+            .clone()
+            .filter(|hdr| hdr.mode != HdrMode::Off)?;
         let caps = caps.with_peak_luminance(hdr.peak_luminance.map(|v| v.0));
         Some((hdr, caps))
     }
@@ -2651,6 +2659,7 @@ impl Niri {
             return ImageDescription::SRGB;
         };
         match hdr.mode {
+            HdrMode::Off => ImageDescription::SRGB,
             HdrMode::On => Self::hdr_blend_description(&hdr, caps),
             HdrMode::Auto => {
                 if self.output_hdr_image_description(output).is_some() {
@@ -2685,6 +2694,7 @@ impl Niri {
             return ImageDescription::SRGB;
         };
         match hdr.mode {
+            HdrMode::Off => ImageDescription::SRGB,
             HdrMode::On => Self::hdr_blend_description(&hdr, caps),
             HdrMode::Auto => {
                 let is_active_fullscreen = window.sizing_mode().is_fullscreen()

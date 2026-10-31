@@ -345,6 +345,10 @@ The optional `mode` property controls when the output is in HDR:
   nvidia with DisplayPort, any metadata change would be one). Costs: SDR-only fullscreen
   applications lose direct scanout on this output, and the cursor is rendered without the cursor
   plane.
+- `mode="off"`: the output stays SDR, but keeps its HDR settings and 10-bit scanout, so HDR can be
+  switched on at runtime without recreating the output: with the `toggle-hdr` action (on the output
+  under the cursor) or `niri msg output <name> hdr on|off|toggle`. Toggling turns `on` and `auto`
+  off, and `off` on.
 
 The optional `reference-luminance` child (in cd/m²) is the luminance that SDR white (full white in
 an SDR application) is displayed at while the output is in HDR. Defaults to 203 (the BT.2408

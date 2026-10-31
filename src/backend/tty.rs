@@ -2369,7 +2369,8 @@ impl Tty {
                     .and_then(|h| h.peak_luminance)
                     .map(|v| v.0),
             );
-            let hdr_allowed = hdr_config.is_some() && surface.hdr_supported;
+            let hdr_allowed = hdr_config.as_ref().is_some_and(|h| h.mode != HdrMode::Off)
+                && surface.hdr_supported;
             let max_bpc = output_config
                 .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
                 .unwrap_or(None);

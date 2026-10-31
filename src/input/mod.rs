@@ -929,6 +929,20 @@ impl State {
             Action::PowerOnMonitors => {
                 self.niri.activate_monitors(&mut self.backend);
             }
+            Action::ToggleHdr => {
+                let output = self
+                    .niri
+                    .output_under_cursor()
+                    .or_else(|| self.niri.layout.active_output().cloned());
+                if let Some(output) = output {
+                    self.apply_transient_output_config(
+                        &output.name(),
+                        niri_ipc::OutputAction::Hdr {
+                            hdr: niri_ipc::HdrToSet::Toggle,
+                        },
+                    );
+                }
+            }
             Action::ToggleDebugTint => {
                 self.backend.toggle_debug_tint();
                 self.niri.queue_redraw_all();

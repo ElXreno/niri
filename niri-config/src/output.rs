@@ -5,7 +5,7 @@ use knuffel::decode::Context;
 use knuffel::errors::DecodeError;
 use knuffel::traits::ErrorSpan;
 use knuffel::Decode;
-use niri_ipc::{ConfiguredMode, HSyncPolarity, Transform, VSyncPolarity};
+use niri_ipc::{ConfiguredMode, HSyncPolarity, HdrToSet, Transform, VSyncPolarity};
 
 use crate::gestures::HotCorners;
 use crate::{Color, FloatOrInt, LayoutPart};
@@ -179,6 +179,7 @@ pub enum HdrMode {
     /// PQ/BT.2020 content — so applications that only probe HDR support once at startup (e.g.
     /// many SDL games) detect it.
     On,
+    Off,
 }
 
 impl std::str::FromStr for HdrMode {
@@ -188,10 +189,28 @@ impl std::str::FromStr for HdrMode {
         match s {
             "auto" => Ok(Self::Auto),
             "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
             _ => Err(miette::miette!(
-                r#"invalid HDR mode, can be "auto" or "on""#
+                r#"invalid HDR mode, can be "auto", "on" or "off""#
             )),
         }
+    }
+}
+
+pub fn set_hdr(hdr: &mut Option<Hdr>, to: HdrToSet) {
+    let on = match to {
+        HdrToSet::On => true,
+        HdrToSet::Off => false,
+        HdrToSet::Toggle => hdr.as_ref().is_none_or(|hdr| hdr.mode == HdrMode::Off),
+    };
+    let mode = if on { HdrMode::On } else { HdrMode::Off };
+    if let Some(current) = hdr.as_mut() {
+        current.mode = mode;
+    } else if on {
+        *hdr = Some(Hdr {
+            mode,
+            ..Default::default()
+        });
     }
 }
 
@@ -620,6 +639,55 @@ mod tests {
         assert!("1920x".parse::<ConfiguredMode>().is_err());
         assert!("1920x1080@".parse::<ConfiguredMode>().is_err());
         assert!("1920x1080@60Hz".parse::<ConfiguredMode>().is_err());
+    }
+
+    #[test]
+    fn parse_hdr_mode() {
+        assert_eq!("off".parse::<HdrMode>().unwrap(), HdrMode::Off);
+        assert_eq!("on".parse::<HdrMode>().unwrap(), HdrMode::On);
+        assert_eq!("auto".parse::<HdrMode>().unwrap(), HdrMode::Auto);
+        assert!("enabled".parse::<HdrMode>().is_err());
+    }
+
+    #[test]
+    fn toggle_hdr() {
+        let configured = Hdr {
+            mode: HdrMode::Off,
+            reference_luminance: Some(FloatOrInt(350.)),
+            peak_luminance: None,
+        };
+        let mut hdr = Some(configured.clone());
+        set_hdr(&mut hdr, HdrToSet::Toggle);
+        assert_eq!(
+            hdr,
+            Some(Hdr {
+                mode: HdrMode::On,
+                ..configured.clone()
+            })
+        );
+        set_hdr(&mut hdr, HdrToSet::Toggle);
+        assert_eq!(hdr, Some(configured.clone()));
+
+        let mut auto = Some(Hdr {
+            mode: HdrMode::Auto,
+            ..configured
+        });
+        set_hdr(&mut auto, HdrToSet::Toggle);
+        assert_eq!(auto.map(|hdr| hdr.mode), Some(HdrMode::Off));
+
+        let mut none = None;
+        set_hdr(&mut none, HdrToSet::Off);
+        assert_eq!(none, None);
+        set_hdr(&mut none, HdrToSet::Toggle);
+        assert_eq!(
+            none,
+            Some(Hdr {
+                mode: HdrMode::On,
+                ..Default::default()
+            })
+        );
+        set_hdr(&mut none, HdrToSet::On);
+        assert_eq!(none.map(|hdr| hdr.mode), Some(HdrMode::On));
     }
 
     fn make_output_name(

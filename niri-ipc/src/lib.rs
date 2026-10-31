@@ -203,6 +203,8 @@ pub enum Action {
     PowerOffMonitors {},
     /// Power on all monitors via DPMS.
     PowerOnMonitors {},
+    /// Toggle HDR on the output under the cursor, or the focused output.
+    ToggleHdr {},
     /// Spawn a command.
     Spawn {
         /// Command to spawn.
@@ -1119,6 +1121,25 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", arg())]
         max_bpc: MaxBpc,
     },
+    /// Switch HDR on or off.
+    Hdr {
+        /// HDR state to set.
+        #[cfg_attr(feature = "clap", arg())]
+        hdr: HdrToSet,
+    },
+}
+
+/// Output HDR state to set.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum HdrToSet {
+    /// Always in HDR.
+    On,
+    /// SDR, keeping the configured HDR settings.
+    Off,
+    /// Off if HDR is on or auto, on otherwise.
+    Toggle,
 }
 
 /// Output mode to set.
